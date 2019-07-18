@@ -1,0 +1,249 @@
+#include <Windows.h>
+
+#include <iostream>
+
+class TimeCounter
+{
+	LARGE_INTEGER beginCount;
+	LARGE_INTEGER endCount;
+	LARGE_INTEGER frequency;
+public:
+	void begin()
+	{
+		QueryPerformanceFrequency(&frequency);
+		QueryPerformanceCounter(&beginCount);
+	}
+
+	void end()
+	{
+		QueryPerformanceCounter(&endCount);
+	}
+
+	double GetDurationAsSecond()
+	{
+		return (double)(endCount.QuadPart - beginCount.QuadPart) / (double)frequency.QuadPart;
+	}
+	double GetDurationAsMillSecond()
+	{
+		return (double)(endCount.QuadPart - beginCount.QuadPart) / (double)frequency.QuadPart * 1000;
+	}
+
+};
+
+typedef struct _COPY_CHUNK
+{
+	OVERLAPPED Overlapped;
+	LPVOID Buffer;
+} COPY_CHUNK, *PCOPY_CHUNK;
+
+const int BUFFER_SIZE = 256 * 1024;
+const int MAX_CONCURRENT_IO = 20;
+COPY_CHUNK CopyChunk[MAX_CONCURRENT_IO];
+
+HANDLE hSrcFile;
+HANDLE hDstFile;
+
+HANDLE hReadPort;
+HANDLE hWritePort;
+DWORD dwPageSize;
+
+
+void ReadLoop(ULARGE_INTEGER fileSize)
+{
+	ULARGE_INTEGER uliReadPointer = {};
+	DWORD NumberBytes;
+	int PendingIO = 0;
+
+	for (int i = 0; i < MAX_CONCURRENT_IO; i++)
+	{
+		if (uliReadPointer.QuadPart >= fileSize.QuadPart)
+			break;
+
+		CopyChunk[i].Buffer = VirtualAlloc(
+			nullptr,
+			BUFFER_SIZE,
+			MEM_COMMIT,
+			PAGE_READWRITE);
+		CopyChunk[i].Overlapped.Offset = uliReadPointer.LowPart;
+		CopyChunk[i].Overlapped.OffsetHigh = uliReadPointer.HighPart;
+		CopyChunk[i].Overlapped.hEvent = nullptr;
+
+		ReadFile(hSrcFile,
+			CopyChunk[i].Buffer,
+			BUFFER_SIZE,
+			&NumberBytes,
+			&CopyChunk[i].Overlapped);
+
+		if (GetLastError() == ERROR_IO_PENDING)
+		{
+			uliReadPointer.QuadPart += BUFFER_SIZE;
+			PendingIO++;
+		}
+	}
+
+	printf("ReadLoop:\t PendingIO = %d\n", PendingIO);
+
+	DWORD_PTR Key;
+	LPOVERLAPPED CompletedOverlapped;
+	while (PendingIO)
+	{
+		GetQueuedCompletionStatus(
+			hWritePort,
+			&NumberBytes,
+			&Key,
+			&CompletedOverlapped,
+			INFINITE);
+
+		if (uliReadPointer.QuadPart < fileSize.QuadPart)
+		{
+			PCOPY_CHUNK Chunk = (PCOPY_CHUNK)CompletedOverlapped;
+			Chunk->Overlapped.Offset = uliReadPointer.LowPart;
+			Chunk->Overlapped.OffsetHigh = uliReadPointer.HighPart;
+			uliReadPointer.QuadPart += BUFFER_SIZE;
+
+			ReadFile(hSrcFile,
+				Chunk->Buffer,
+				BUFFER_SIZE,
+				&NumberBytes,
+				&Chunk->Overlapped);
+
+			printf("ReadLoop:\t Key = %d, read %d bytes\n",Key, BUFFER_SIZE);
+		}
+		else
+		{
+			PendingIO--;
+		}
+	}
+}
+
+DWORD __stdcall WriteLoop(LPVOID param)
+{
+	ULARGE_INTEGER FileSize = *(PULARGE_INTEGER)param;
+
+	BOOL Success;
+	DWORD_PTR Key;
+	LPOVERLAPPED CompletedOverlapped;
+	PCOPY_CHUNK Chunk;
+	DWORD NumberBytes;
+	ULARGE_INTEGER TotalBytesWritten;
+	TotalBytesWritten.QuadPart = 0;
+
+	while (true)
+	{
+		GetQueuedCompletionStatus(hReadPort,
+			&NumberBytes,
+			&Key,
+			&CompletedOverlapped,
+			INFINITE);
+
+		printf("WriteLoop:\t Key = %d, NumberBytes = %d\n", Key, NumberBytes);
+
+		TotalBytesWritten.QuadPart += NumberBytes;
+
+		Chunk = (PCOPY_CHUNK)CompletedOverlapped;
+
+		NumberBytes = (NumberBytes + dwPageSize - 1) & ~(dwPageSize - 1);
+
+		WriteFile(hDstFile,
+			Chunk->Buffer,
+			NumberBytes,
+			&NumberBytes,
+			&Chunk->Overlapped);
+		if (TotalBytesWritten.QuadPart >= FileSize.QuadPart)
+			return 0;
+	}
+}
+
+int __cdecl main(void)
+{
+	LPCTSTR szSrcFile = TEXT("C:\\Code\\Files\\Cosmos.mkv");
+	LPCTSTR szDstFile = TEXT("C:\\Code\\Files\\CosmosCopy.mkv");
+
+	hSrcFile = CreateFile(
+		szSrcFile,
+		GENERIC_READ | GENERIC_WRITE,
+		FILE_SHARE_READ, 
+		nullptr,
+		OPEN_EXISTING,
+		FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, 
+		nullptr);
+
+	ULARGE_INTEGER uliFileSize = {};
+	uliFileSize.LowPart = GetFileSize(hSrcFile, &uliFileSize.HighPart);
+
+	hDstFile = CreateFile(
+		szDstFile,
+		GENERIC_READ | GENERIC_WRITE,
+		FILE_SHARE_READ | FILE_SHARE_WRITE,
+		NULL,
+		CREATE_ALWAYS,
+		FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED,
+		hSrcFile);
+
+	SYSTEM_INFO sysInfo = { };
+	GetSystemInfo(&sysInfo);
+	dwPageSize = sysInfo.dwPageSize;
+
+	ULARGE_INTEGER uliInitializeFileSize = {};
+	uliInitializeFileSize.QuadPart = (uliFileSize.QuadPart + dwPageSize - 1)&~((DWORD_PTR)(dwPageSize - 1));
+	SetFilePointer(hDstFile, uliInitializeFileSize.LowPart, (PLONG)&uliInitializeFileSize.HighPart, FILE_BEGIN);
+	SetEndOfFile(hDstFile);
+
+	//
+	hReadPort = CreateIoCompletionPort(
+		INVALID_HANDLE_VALUE,
+		nullptr,
+		(DWORD_PTR)hSrcFile,
+		1);
+
+	hReadPort = CreateIoCompletionPort(
+		hSrcFile,
+		hReadPort,
+		(DWORD_PTR)hSrcFile,
+		1);
+
+	hWritePort = CreateIoCompletionPort(
+		hDstFile,
+		nullptr,
+		(DWORD_PTR)hDstFile,
+		1);
+
+	HANDLE hWriteThread = CreateThread(
+		nullptr,
+		0,
+		WriteLoop,
+		&uliFileSize,
+		0,
+		nullptr);
+	CloseHandle(hWriteThread);
+
+	TimeCounter tc;
+	tc.begin();
+	ReadLoop(uliFileSize);
+	tc.end();
+
+	HANDLE hBufferedHandle = CreateFile(
+		szDstFile,
+		GENERIC_WRITE,
+		FILE_SHARE_READ | FILE_SHARE_WRITE,
+		nullptr,
+		OPEN_EXISTING,
+		0, 
+		nullptr);
+
+	SetFilePointer(hBufferedHandle,
+		uliFileSize.LowPart,
+		(PLONG)&uliFileSize.HighPart,
+		FILE_BEGIN);
+
+	SetEndOfFile(hBufferedHandle);
+
+	CloseHandle(hBufferedHandle);
+	CloseHandle(hSrcFile);
+	CloseHandle(hDstFile);
+
+	printf("%d bytes copied in %.4f seconds\n", uliFileSize.LowPart, tc.GetDurationAsSecond());
+	printf("%.2f MB/sec\n", (LONGLONG)uliFileSize.QuadPart / (1024 * 1024) / tc.GetDurationAsSecond());
+
+	return 0;
+}
